@@ -1,0 +1,7 @@
+string building_name
+---
+bool success
+string message
+---
+string status
+float32 progress
