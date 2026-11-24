@@ -1,0 +1,11 @@
+# Request
+string building_name
+float32 luggage_weight
+---
+# Response
+bool accepted
+string message
+float32 estimated_distance
+int32 base_fee
+int32 distance_fee
+int32 total_fee

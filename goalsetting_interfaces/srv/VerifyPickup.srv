@@ -1,0 +1,6 @@
+# Request
+string entered_pin
+---
+# Response
+bool verified
+string message

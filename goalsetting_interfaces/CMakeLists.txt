@@ -1,4 +1,3 @@
-
 cmake_minimum_required(VERSION 3.8)
 project(goalsetting_interfaces)
 
@@ -8,6 +7,8 @@ find_package(action_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/GoToBuilding.action"
+  "srv/CalculateFare.srv"
+   "srv/VerifyPickup.srv"
   DEPENDENCIES action_msgs
 )
 
