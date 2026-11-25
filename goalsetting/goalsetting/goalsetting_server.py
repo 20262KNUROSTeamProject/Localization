@@ -1,5 +1,4 @@
-
-import asyncio
+import time
 import math
 
 import rclpy
@@ -15,7 +14,7 @@ from nav2_msgs.msg import SpeedLimit
 from goalsetting_interfaces.action import GoToBuilding
 from goalsetting_interfaces.srv import CalculateFare
 from goalsetting_interfaces.srv import VerifyPickup
-
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 class GoalsettingServer(Node):
 
@@ -23,9 +22,9 @@ class GoalsettingServer(Node):
         super().__init__('goalsetting_server')
 
         self.building_positions = {
-            '테크노 빌딩': (1.9018, 4.1184, 0.0),
-            '종합 정보 센터': (6.0569, 2.5835, 3.09),
-            '도서관': (5.1261, -1.7043, 1.590),
+            '테크노 빌딩': (2.016, -0.452, 0.0),
+            '종합 정보 센터': (-1.178, -0.711, 3.09),
+            '도서관': (-1.66, 0.713, 1.590),
         }
 
         self.action_group = ReentrantCallbackGroup()
@@ -76,12 +75,20 @@ class GoalsettingServer(Node):
         self.last_y = None
         self.traveled_distance = 0.0
 
+        # AMCL 위치 수신 확인
+        self.pose_count = 0
+
         # 현 위치 구독
+        amcl_qos = QoSProfile(
+                depth=10,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL
+        )
         self.pose_subscriber = self.create_subscription(
             PoseWithCovarianceStamped,
             '/amcl_pose',
             self.pose_callback,
-            10
+            amcl_qos
         )
 
         # 요금 계산 Service
@@ -102,6 +109,14 @@ class GoalsettingServer(Node):
     def pose_callback(self, msg):
         new_x = msg.pose.pose.position.x
         new_y = msg.pose.pose.position.y
+
+        self.pose_count += 1
+
+        # AMCL 위치가 들어오는지 확인
+        if self.pose_count == 1:
+            self.get_logger().info(
+                f'/amcl_pose 수신 시작: x={new_x:.2f}, y={new_y:.2f}'
+            )
 
         # 거리 누적
         if self.is_tracking_movement:
@@ -289,16 +304,13 @@ class GoalsettingServer(Node):
 
     def nav_feedback_callback(self, goal_handle, initial_distance, feedback_msg):
         distance = feedback_msg.feedback.distance_remaining
+        
+        # self.get_logger().info(f'nav feedback log: {feedback_msg.feedback}')
 
-        if initial_distance[0] is None:
+        if initial_distance[0] is None and distance > 0.0:
             initial_distance[0] = distance
 
-        if initial_distance[0] > 0:
-            progress = (1.0 - distance / initial_distance[0]) * 100.0
-        else:
-            progress = 0.0
-
-        progress = max(0.0, min(100.0, progress))
+        progress = 100 * (self.traveled_distance / (self.traveled_distance+distance)) if distance > 0.0 else 0.0
 
         feedback = GoToBuilding.Feedback()
         feedback.status = f'이동 중: 남은 거리 {distance:.2f} m'
@@ -364,6 +376,32 @@ class GoalsettingServer(Node):
 
         initial_distance = [None]
 
+        # 현재 AMCL 위치가 있는지 확인
+        if self.current_x is None or self.current_y is None:
+            self.reset_speed_limit()
+
+            goal_handle.abort()
+
+            result.success = False
+            result.traveled_distance = 0.0
+            result.final_fare = 0
+            result.message = (
+                '/amcl_pose에서 현재 위치를 받지 못했습니다.'
+            )
+
+            return result
+
+        # 실제 이동 거리 측정 초기화 및 시작
+        self.traveled_distance = 0.0
+        self.last_x = self.current_x
+        self.last_y = self.current_y
+        self.is_tracking_movement = True
+
+        self.get_logger().info(
+            f'이동 거리 추적 시작: '
+            f'x={self.last_x:.2f}, y={self.last_y:.2f}'
+        )
+
         nav_goal_future = self.nav_client.send_goal_async(
             nav_goal,
             feedback_callback=lambda msg: self.nav_feedback_callback(
@@ -374,18 +412,12 @@ class GoalsettingServer(Node):
         nav_goal_handle = await nav_goal_future
 
         if not nav_goal_handle.accepted:
+            self.is_tracking_movement = False
             self.reset_speed_limit()
             goal_handle.abort()
             result.success = False
             result.message = 'Nav2 목적지 요청을 거부했습니다.'
             return result
-
-        self.get_logger().info('Nav2 목적지 요청 승인')
-        # 실제 이동 거리 측정 시작
-        self.traveled_distance = 0.0
-        self.last_x = self.current_x
-        self.last_y = self.current_y
-        self.is_tracking_movement = True
 
         result_future = nav_goal_handle.get_result_async()
 
@@ -401,10 +433,12 @@ class GoalsettingServer(Node):
                 goal_handle.canceled()
                 return result
 
-            await asyncio.sleep(0.1)
+        time.sleep(0.2)
 
         nav_result = await result_future
 
+        self.get_logger().info(f'Nav 결과 상태 코드: {nav_result.status}')
+        self.get_logger().info(f'Nav2 결과 내용: {nav_result.result}')
         # 이동 종료 및 실제 이동 거리 확정
         self.is_tracking_movement = False
         self.reset_speed_limit()
@@ -436,7 +470,13 @@ class GoalsettingServer(Node):
                 f'최종 요금: {result.final_fare}원'
             )
             self.get_logger().info(result.message)
-
+        elif nav_result.status != GoalStatus.STATUS_SUCCEEDED:
+            result.success = False
+            result.traveled_distance = float(self.traveled_distance)
+            result.final_fare = 0
+            result.message = (f'Nav2 이동 실패. 상태 코드: {nav_result.status}')
+            goal_handle.abort()
+            return result
         else:
             self.current_pickup_pin = None
             self.pickup_ready = False
